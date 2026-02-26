@@ -6,3 +6,4 @@ azure-functions
 azure-functions-durable
 azure-data-tables
 Pillow
+PyPDF2>=3.0.0 # added to handle PDF processing

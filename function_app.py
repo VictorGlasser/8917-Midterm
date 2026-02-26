@@ -11,11 +11,12 @@ import io                                 # Python built-in for byte stream hand
 import os                                 # Python built-in for environment variables
 import uuid                               # Python built-in for generating unique IDs
 from datetime import datetime             # Python built-in for timestamps
-
+from typing import Dict, List             # Access to the dictionary and list types for type hints [AI suggestion]
+import PyPDF2                             # PyPDF2 - PDF processing library [AI suggestion]
+import re                                 # Python built-in for regular expressions (used for sensitive data detection) [AI suggestion]
 # =============================================================================
 # CREATE THE DURABLE FUNCTION APP
 # =============================================================================
-# Same as Week 4: df.DFApp instead of func.FunctionApp
 myApp = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 # =============================================================================
@@ -24,11 +25,11 @@ myApp = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 # This helper function creates a connection to Azure Table Storage.
 # It uses the same connection string as our Blob trigger.
 # For local development, this connects to Azurite's Table Storage emulator.
-TABLE_NAME = "ImageAnalysisResults"
+TABLE_NAME = "PdfAnalysisResults"
 
 def get_table_client():
     """Get a TableClient for storing/retrieving analysis results."""
-    connection_string = os.environ["ImageStorageConnection"]
+    connection_string = os.environ["PdfStorageConnection"] ## updates connection string
     table_service = TableServiceClient.from_connection_string(connection_string)
     # create_table_if_not_exists ensures the table exists before we use it
     table_service.create_table_if_not_exists(TABLE_NAME)
@@ -37,32 +38,22 @@ def get_table_client():
 # =============================================================================
 # 1. CLIENT FUNCTION (Blob Trigger - The Entry Point)
 # =============================================================================
-# Unlike Week 4 where you used an HTTP trigger, this function triggers
-# automatically when an image is uploaded to the "images" container.
-#
-# How it works:
-#   1. User uploads an image to the "images" container in Blob Storage
-#   2. Azure detects the new blob and triggers this function
-#   3. This function starts the orchestrator, passing the blob name
-#
-# The path "images/{name}" means:
-#   - Watch the "images" container
-#   - {name} captures the filename (e.g., "photo.jpg")
+# Function triggers automatically when a PDF image is uploaded to the "pdfs" container.
 @myApp.blob_trigger(
     arg_name="myblob",
-    path="images/{name}",
-    connection="ImageStorageConnection"
+    path="pdfs/{name}", ## Uses a new container
+    connection="PdfStorageConnection"
 )
 @myApp.durable_client_input(client_name="client")
 async def blob_trigger(myblob: func.InputStream, client):
-    # Get the blob name (e.g., "images/photo.jpg")
+    # Get the blob name (e.g., "pdfs/pdf1.jpg")
     blob_name = myblob.name
     # Read the blob content as bytes (the actual image data)
     blob_bytes = myblob.read()
     # Get the file size in KB
     blob_size_kb = round(len(blob_bytes) / 1024, 2)
 
-    logging.info(f"New image detected: {blob_name} ({blob_size_kb} KB)")
+    logging.info(f"New pdf detected: {blob_name} ({blob_size_kb} KB)") ## change makes logs more logical
 
     # Prepare input data for the orchestrator
     # We pass the blob name and the raw image bytes (as a list of integers)
@@ -74,9 +65,9 @@ async def blob_trigger(myblob: func.InputStream, client):
         "blob_size_kb": blob_size_kb
     }
 
-    # Start the orchestrator (same concept as Week 4's client.start_new)
+    # Start the orchestrator
     instance_id = await client.start_new(
-        "image_analyzer_orchestrator",
+        "pdf_analyzer_orchestrator", # change orchestration function's name to match new function
         client_input=input_data
     )
 
@@ -88,12 +79,8 @@ async def blob_trigger(myblob: func.InputStream, client):
 # This orchestrator implements a HYBRID pattern:
 #   - Fan-Out/Fan-In: Run 4 analyses in parallel
 #   - Chaining: Then generate report -> store results (sequential)
-#
-# Compare to Week 4's orchestrator:
-#   Week 4: yield call_activity(...) three times sequentially
-#   Lab 2:  yield context.task_all([...]) for parallel, then yield for sequential
 @myApp.orchestration_trigger(context_name="context")
-def image_analyzer_orchestrator(context):
+def pdf_analyzer_orchestrator(context):
     # Get the input data passed from the blob trigger
     input_data = context.get_input()
 
@@ -105,34 +92,25 @@ def image_analyzer_orchestrator(context):
     # Create a list of tasks WITHOUT yielding each one individually.
     # Each call_activity starts a task but doesn't wait for it.
     analysis_tasks = [
-        context.call_activity("analyze_colors", input_data),
-        context.call_activity("analyze_objects", input_data),
-        context.call_activity("analyze_text", input_data),
-        context.call_activity("analyze_metadata", input_data),
+        context.call_activity("extract_text", input_data), ## updated activity name
+        context.call_activity("extract_metadata", input_data), ## updated activity name
+        context.call_activity("analyze_statistics", input_data), ## updated activity name
+        context.call_activity("detect_sensitive_data", input_data), ## updated activity name
     ]
 
     # FAN-IN: yield context.task_all() waits for ALL tasks to complete.
-    # This is the key difference from Week 4's sequential yield.
-    # All 4 activities run simultaneously, and we get all results at once.
     results = yield context.task_all(analysis_tasks)
-
-    # results is a list in the same order as analysis_tasks:
-    # results[0] = analyze_colors result
-    # results[1] = analyze_objects result
-    # results[2] = analyze_text result
-    # results[3] = analyze_metadata result
 
     # =========================================================================
     # STEP 2: CHAIN - Generate report from combined results
     # =========================================================================
     # Now we chain: take the parallel results and combine them into a report.
-    # This must happen AFTER all analyses complete (sequential).
     report_input = {
         "blob_name": input_data["blob_name"],
-        "colors": results[0],
-        "objects": results[1],
-        "text": results[2],
-        "metadata": results[3],
+        "text": results[0], ## updated activity name
+        "metadata": results[1], ## updated activity name
+        "stats": results[2], ## updated activity name
+        "sensitive_data": results[3], ## updated activity name
     }
 
     report = yield context.call_activity("generate_report", report_input)
@@ -140,228 +118,120 @@ def image_analyzer_orchestrator(context):
     # =========================================================================
     # STEP 3: CHAIN - Store the report in Table Storage
     # =========================================================================
-    # Final step: persist the report to Azure Table Storage.
+    # Persist the report to Azure Table Storage.
     record = yield context.call_activity("store_results", report)
 
     return record
 
 # =============================================================================
-# 3. ACTIVITY: Analyze Colors
+# 3. ACTIVITY: extract text
 # =============================================================================
-# This activity extracts dominant colors from the image using Pillow.
-# It samples pixels from the image and identifies the most common colors.
-#
-# In a production app, you might use Azure Computer Vision API instead.
 @myApp.activity_trigger(input_name="inputData")
-def analyze_colors(inputData: dict):
-    logging.info("Analyzing colors...")
-
+def extract_text(inputData: dict) -> Dict[str, List[Dict[str, str]]]: # [proposed by AI]
+    logging.info(f"Starting PDF text extraction for {inputData.get('blob_name')}")
     try:
-        # Convert the byte list back to bytes, then open as an image
-        image_bytes = bytes(inputData["blob_bytes"])
-        image = Image.open(io.BytesIO(image_bytes))
+        pdf_bytes = bytes(inputData["blob_bytes"])
+        pdf_stream = io.BytesIO(pdf_bytes)
+        reader = PyPDF2.PdfReader(pdf_stream)
+        pages_text = []
 
-        # Convert to RGB if necessary (handles PNG with alpha, grayscale, etc.)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        # Resize to a small size for faster color sampling
-        # We don't need full resolution just to get dominant colors
-        small_image = image.resize((50, 50))
-
-        # Get all pixels as a list of (R, G, B) tuples
-        pixels = list(small_image.getdata())
-
-        # Count occurrences of each color (rounded to nearest 10 for grouping)
-        color_counts = {}
-        for r, g, b in pixels:
-            # Round to nearest 32 to group similar colors together
-            key = (r // 32 * 32, g // 32 * 32, b // 32 * 32)
-            color_counts[key] = color_counts.get(key, 0) + 1
-
-        # Sort by frequency and get top 5 colors
-        sorted_colors = sorted(color_counts.items(), key=lambda x: x[1], reverse=True)
-        top_colors = []
-        for (r, g, b), count in sorted_colors[:5]:
-            hex_color = f"#{r:02x}{g:02x}{b:02x}"
-            top_colors.append({
-                "hex": hex_color,
-                "rgb": {"r": r, "g": g, "b": b},
-                "percentage": round(count / len(pixels) * 100, 1)
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            pages_text.append({
+                "page_number": page_number,
+                "text": text
             })
 
-        # Determine if image is mostly grayscale
-        # In grayscale images, R, G, and B values are very close to each other
-        grayscale_pixels = sum(1 for r, g, b in pixels if abs(r - g) < 30 and abs(g - b) < 30)
-        is_grayscale = grayscale_pixels / len(pixels) > 0.9
-
-        return {
-            "dominantColors": top_colors,
-            "isGrayscale": is_grayscale,
-            "totalPixelsSampled": len(pixels)
-        }
+        logging.info(f"Extracted text from {len(pages_text)} pages.")
+        return {"pages": pages_text}
 
     except Exception as e:
-        logging.error(f"Color analysis failed: {str(e)}")
-        return {
-            "dominantColors": [],
-            "isGrayscale": False,
-            "totalPixelsSampled": 0,
-            "error": str(e)
-        }
+        logging.error(f"PDF text extraction failed: {str(e)}")
+        return {"pages": [], "error": str(e)}
 
 # =============================================================================
-# 4. ACTIVITY: Analyze Objects (Mock)
+# 4. ACTIVITY: Extract Metadata
 # =============================================================================
-# This activity simulates object detection.
-# In a production app, you would call Azure Computer Vision API here.
-#
-# Why mock? Calling an external API requires API keys and costs money.
-# The mock lets you focus on learning the Durable Functions pattern.
-# The "Stretch Goal" section at the end shows how to swap in the real API.
 @myApp.activity_trigger(input_name="inputData")
-def analyze_objects(inputData: dict):
-    logging.info("Analyzing objects...")
-
+def extract_metadata(inputData: dict) -> Dict[str, str]: # [proposed by AI]
+    logging.info(f"Extracting metadata for {inputData.get('blob_name')}")
     try:
-        image_bytes = bytes(inputData["blob_bytes"])
-        image = Image.open(io.BytesIO(image_bytes))
-        width, height = image.size
-
-        # Mock object detection based on image characteristics
-        # A real API would return actual detected objects
-        mock_objects = []
-
-        # Simulate detection based on image dimensions and properties
-        if width > height:
-            mock_objects.append({"name": "landscape", "confidence": 0.85})
-        elif height > width:
-            mock_objects.append({"name": "portrait", "confidence": 0.82})
-        else:
-            mock_objects.append({"name": "square composition", "confidence": 0.90})
-
-        # Add some generic objects based on image size
-        if width * height > 1000000:  # > 1 megapixel
-            mock_objects.append({"name": "high-resolution scene", "confidence": 0.78})
-
-        mock_objects.append({"name": "digital image", "confidence": 0.99})
+        pdf_bytes = bytes(inputData["blob_bytes"])
+        pdf_stream = io.BytesIO(pdf_bytes)
+        reader = PyPDF2.PdfReader(pdf_stream)
+        info = reader.metadata
 
         return {
-            "objects": mock_objects,
-            "objectCount": len(mock_objects),
-            "note": "Mock analysis - replace with Azure Computer Vision for real detection"
+            "author": info.author if info.author else "",
+            "title": info.title if info.title else "",
+            "subject": info.subject if info.subject else "",
+            "keywords": info.keywords if info.keywords else "",
+            "creator": info.creator if info.creator else "",
+            "producer": info.producer if info.producer else "",
+            "creation_date": str(info.creation_date) if info.creation_date else "",
+            "mod_date": str(info.modification_date) if info.modification_date else ""
         }
 
     except Exception as e:
-        logging.error(f"Object analysis failed: {str(e)}")
-        return {
-            "objects": [],
-            "objectCount": 0,
-            "error": str(e)
-        }
+        logging.error(f"Metadata extraction failed: {str(e)}")
+        return {"error": str(e)}
 
 # =============================================================================
-# 5. ACTIVITY: Analyze Text / OCR (Mock)
+# 5. ACTIVITY: Analyze Statistics
 # =============================================================================
-# This activity simulates Optical Character Recognition (OCR).
-# In a production app, you would call Azure Computer Vision Read API.
 @myApp.activity_trigger(input_name="inputData")
-def analyze_text(inputData: dict):
-    logging.info("Analyzing text (OCR)...")
+def analyze_statistics(inputData: dict) -> Dict[str, float]: # [proposed by AI]
+    pages = inputData.get("pages", [])
+    total_words = sum(len(page["text"].split()) for page in pages)
+    page_count = len(pages)
+    avg_words_per_page = total_words / page_count if page_count > 0 else 0
+    estimated_reading_time_min = total_words / 200  # assuming 200 wpm
 
-    try:
-        image_bytes = bytes(inputData["blob_bytes"])
-        image = Image.open(io.BytesIO(image_bytes))
-
-        # Mock OCR analysis
-        # Real OCR would scan the image for any visible text
-        # Here we simulate by checking image properties
-        width, height = image.size
-
-        return {
-            "hasText": False,
-            "extractedText": "",
-            "confidence": 0.0,
-            "language": "unknown",
-            "note": "Mock OCR - replace with Azure Computer Vision Read API for real text extraction"
-        }
-
-    except Exception as e:
-        logging.error(f"Text analysis failed: {str(e)}")
-        return {
-            "hasText": False,
-            "extractedText": "",
-            "confidence": 0.0,
-            "error": str(e)
-        }
+    logging.info(f"Stats: {total_words} words across {page_count} pages.")
+    return {
+        "page_count": page_count,
+        "word_count": total_words,
+        "avg_words_per_page": avg_words_per_page,
+        "estimated_reading_time_min": round(estimated_reading_time_min, 2)
+    }
 
 # =============================================================================
-# 6. ACTIVITY: Analyze Metadata (Real Analysis)
+# 6. ACTIVITY: Detect Sensitive Data
 # =============================================================================
-# Unlike the mock activities above, this one performs REAL analysis.
-# Pillow can extract actual image metadata: dimensions, format, color mode,
-# and EXIF data (camera info, GPS coordinates, etc.)
-@myApp.activity_trigger(input_name="inputData")
-def analyze_metadata(inputData: dict):
-    logging.info("Analyzing metadata...")
+EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+PHONE_REGEX = r"\+?\d[\d\s\-\(\)]{7,}\d"
+URL_REGEX = r"https?://[^\s]+"
+DATE_REGEX = r"\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2})\b"
 
-    try:
-        image_bytes = bytes(inputData["blob_bytes"])
-        blob_size_kb = inputData["blob_size_kb"]
-        image = Image.open(io.BytesIO(image_bytes))
+@myApp.activity_trigger(input_name="textData")
+def detect_sensitive_data(textData: dict) -> Dict[str, List[str]]:
+    pages = textData.get("pages", [])
+    emails, phones, urls, dates = [], [], [], []
 
-        width, height = image.size
-        total_pixels = width * height
+    for page in pages:
+        text = page.get("text", "")
+        emails.extend(re.findall(EMAIL_REGEX, text))
+        phones.extend(re.findall(PHONE_REGEX, text))
+        urls.extend(re.findall(URL_REGEX, text))
+        dates.extend(re.findall(DATE_REGEX, text))
 
-        # Try to extract EXIF data (camera info, date taken, etc.)
-        exif_data = {}
-        try:
-            raw_exif = image._getexif()
-            if raw_exif:
-                # Map EXIF tag numbers to human-readable names
-                from PIL.ExifTags import TAGS
-                for tag_id, value in raw_exif.items():
-                    tag_name = TAGS.get(tag_id, tag_id)
-                    # Only include string/number values (skip binary data)
-                    if isinstance(value, (str, int, float)):
-                        exif_data[str(tag_name)] = str(value)
-        except (AttributeError, Exception):
-            # Not all image formats support EXIF
-            pass
-
-        return {
-            "width": width,
-            "height": height,
-            "format": image.format or "Unknown",
-            "mode": image.mode,
-            "totalPixels": total_pixels,
-            "megapixels": round(total_pixels / 1000000, 2),
-            "sizeKB": blob_size_kb,
-            "aspectRatio": f"{width}:{height}",
-            "hasExifData": len(exif_data) > 0,
-            "exifData": exif_data
-        }
-
-    except Exception as e:
-        logging.error(f"Metadata analysis failed: {str(e)}")
-        return {
-            "width": 0,
-            "height": 0,
-            "format": "Unknown",
-            "error": str(e)
-        }
+    return {
+        "emails": list(set(emails)),
+        "phone_numbers": list(set(phones)),
+        "urls": list(set(urls)),
+        "dates": list(set(dates))
+    }
 
 # =============================================================================
 # 7. ACTIVITY: Generate Report
 # =============================================================================
 # This activity takes the results from all 4 analyses and combines them
-# into a single unified report. This is the "reduce" step after the fan-in.
 @myApp.activity_trigger(input_name="reportData")
 def generate_report(reportData: dict):
     logging.info("Generating combined report...")
 
     blob_name = reportData["blob_name"]
-    # Extract just the filename from the full path (e.g., "images/photo.jpg" -> "photo.jpg")
+    # Extract just the filename from the full path (e.g., "pdf/class1.jpg" -> "class1.jpg")
     filename = blob_name.split("/")[-1] if "/" in blob_name else blob_name
 
     report = {
@@ -370,18 +240,17 @@ def generate_report(reportData: dict):
         "blobPath": blob_name,
         "analyzedAt": datetime.utcnow().isoformat(),
         "analyses": {
-            "colors": reportData["colors"],
-            "objects": reportData["objects"],
-            "text": reportData["text"],
-            "metadata": reportData["metadata"],
+            "text": reportData.get("text", {}), ## updated field name
+            "metadata": reportData.get("metadata", {}), ## updated field name
+            "statistics": reportData.get("stats", {}), ## updated field name
+            "sensitive_data": reportData.get("sensitive_data", {}), ## updated field name
         },
-        "summary": {
-            "imageSize": f"{reportData['metadata'].get('width', 0)}x{reportData['metadata'].get('height', 0)}",
-            "format": reportData["metadata"].get("format", "Unknown"),
-            "dominantColor": reportData["colors"]["dominantColors"][0]["hex"] if reportData["colors"].get("dominantColors") else "N/A",
-            "objectsDetected": reportData["objects"].get("objectCount", 0),
-            "hasText": reportData["text"].get("hasText", False),
-            "isGrayscale": reportData["colors"].get("isGrayscale", False),
+        "summary": { ## updated with values from statistics (generated using AI)
+            "pageCount": reportData.get("stats", {}).get("page_count", 0),
+            "wordCount": reportData.get("stats", {}).get("word_count", 0),
+            "avgWordsPerPage": reportData.get("stats", {}).get("avg_words_per_page", 0),
+            "estimatedReadingTimeMin": reportData.get("stats", {}).get("estimated_reading_time_min", 0),
+            "hasText": any(page.get("text") for page in reportData.get("text", {}).get("pages", [])),
         }
     }
 
@@ -394,7 +263,7 @@ def generate_report(reportData: dict):
 # This activity saves the generated report to Azure Table Storage.
 #
 # Table Storage requires two keys:
-#   - PartitionKey: Groups related entities (we use "ImageAnalysis")
+#   - PartitionKey: Groups related entities (we use "PDFAnalysis")
 #   - RowKey: Unique identifier within the partition (we use the report ID)
 @myApp.activity_trigger(input_name="report")
 def store_results(report: dict):
@@ -406,17 +275,17 @@ def store_results(report: dict):
         # Table Storage entities are flat key-value pairs.
         # Complex nested data (like our analyses) must be serialized as JSON strings.
         entity = {
-            "PartitionKey": "ImageAnalysis",
+            "PartitionKey": "PDFAnalysis", # updated partition key to reflect PDF analysis
             "RowKey": report["id"],
             "FileName": report["fileName"],
             "BlobPath": report["blobPath"],
             "AnalyzedAt": report["analyzedAt"],
             # Store complex data as JSON strings
             "Summary": json.dumps(report["summary"]),
-            "ColorAnalysis": json.dumps(report["analyses"]["colors"]),
-            "ObjectAnalysis": json.dumps(report["analyses"]["objects"]),
             "TextAnalysis": json.dumps(report["analyses"]["text"]),
             "MetadataAnalysis": json.dumps(report["analyses"]["metadata"]),
+            "StatisticsAnalysis": json.dumps(report["analyses"]["statistics"]),
+            "SensitiveDataAnalysis": json.dumps(report["analyses"]["sensitive_data"]),
         }
 
         table_client.upsert_entity(entity)
@@ -462,7 +331,7 @@ def get_results(req: func.HttpRequest) -> func.HttpResponse:
             # Get a specific result by ID
             try:
                 entity = table_client.get_entity(
-                    partition_key="ImageAnalysis",
+                    partition_key="PDFAnalysis", # Updated partition key
                     row_key=result_id
                 )
 
@@ -473,11 +342,11 @@ def get_results(req: func.HttpRequest) -> func.HttpResponse:
                     "blobPath": entity["BlobPath"],
                     "analyzedAt": entity["AnalyzedAt"],
                     "summary": json.loads(entity["Summary"]),
-                    "analyses": {
-                        "colors": json.loads(entity["ColorAnalysis"]),
-                        "objects": json.loads(entity["ObjectAnalysis"]),
+                    "analyses": { # updated for new activity functions
                         "text": json.loads(entity["TextAnalysis"]),
                         "metadata": json.loads(entity["MetadataAnalysis"]),
+                        "statistics": json.loads(entity["StatisticsAnalysis"]),
+                        "sensitive_data": json.loads(entity["SensitiveDataAnalysis"]),
                     }
                 }
 
@@ -498,7 +367,7 @@ def get_results(req: func.HttpRequest) -> func.HttpResponse:
             limit = int(req.params.get("limit", "10"))
 
             entities = table_client.query_entities(
-                query_filter="PartitionKey eq 'ImageAnalysis'"
+                query_filter="PartitionKey eq 'PDFAnalysis'" # Updated partition key
             )
 
             results = []
