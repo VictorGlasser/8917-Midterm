@@ -14,6 +14,9 @@ from datetime import datetime             # Python built-in for timestamps
 from typing import Dict, List             # Access to the dictionary and list types for type hints [AI suggestion]
 import PyPDF2                             # PyPDF2 - PDF processing library [AI suggestion]
 import re                                 # Python built-in for regular expressions (used for sensitive data detection) [AI suggestion]
+from pdf2image import convert_from_bytes  # pdf2image - Convert PDF pages to images for OCR fallback [AI suggestion]
+import pytesseract                        # pytesseract - OCR library for text extraction from images [AI suggestion]
+import fitz                               # PyMuPDF
 # =============================================================================
 # CREATE THE DURABLE FUNCTION APP
 # =============================================================================
@@ -81,45 +84,47 @@ async def blob_trigger(myblob: func.InputStream, client):
 #   - Chaining: Then generate report -> store results (sequential)
 @myApp.orchestration_trigger(context_name="context")
 def pdf_analyzer_orchestrator(context):
-    # Get the input data passed from the blob trigger
+    # Get input from the blob trigger
     input_data = context.get_input()
-
     logging.info(f"Orchestrator started for: {input_data['blob_name']}")
 
-    # =========================================================================
-    # STEP 1: FAN-OUT - Run all 4 analyses in parallel
-    # =========================================================================
-    # Create a list of tasks WITHOUT yielding each one individually.
-    # Each call_activity starts a task but doesn't wait for it.
+    # -------------------------
+    # STEP 1: Extract text first
+    # -------------------------
+    text_result = yield context.call_activity("extract_text", input_data)
+    logging.info(f"Text extraction completed: {len(text_result.get('pages', []))} pages found")
+
+    # -------------------------
+    # STEP 2: Run other analyses in parallel
+    # -------------------------
     analysis_tasks = [
-        context.call_activity("extract_text", input_data), ## updated activity name
-        context.call_activity("extract_metadata", input_data), ## updated activity name
-        context.call_activity("analyze_statistics", input_data), ## updated activity name
-        context.call_activity("detect_sensitive_data", input_data), ## updated activity name
+        context.call_activity("extract_metadata", input_data),         # metadata can use original blob
+        context.call_activity("analyze_statistics", text_result),      # statistics need extracted text
+        context.call_activity("detect_sensitive_data", text_result),   # sensitive data detection needs text
     ]
 
-    # FAN-IN: yield context.task_all() waits for ALL tasks to complete.
-    results = yield context.task_all(analysis_tasks)
+    metadata_result, stats_result, sensitive_result = yield context.task_all(analysis_tasks)
+    logging.info("Parallel analyses completed")
 
-    # =========================================================================
-    # STEP 2: CHAIN - Generate report from combined results
-    # =========================================================================
-    # Now we chain: take the parallel results and combine them into a report.
+    # -------------------------
+    # STEP 3: Generate combined report
+    # -------------------------
     report_input = {
         "blob_name": input_data["blob_name"],
-        "text": results[0], ## updated activity name
-        "metadata": results[1], ## updated activity name
-        "stats": results[2], ## updated activity name
-        "sensitive_data": results[3], ## updated activity name
+        "text": text_result,
+        "metadata": metadata_result,
+        "stats": stats_result,
+        "sensitive_data": sensitive_result,
     }
 
     report = yield context.call_activity("generate_report", report_input)
+    logging.info(f"Report generated for: {input_data['blob_name']}")
 
-    # =========================================================================
-    # STEP 3: CHAIN - Store the report in Table Storage
-    # =========================================================================
-    # Persist the report to Azure Table Storage.
+    # -------------------------
+    # STEP 4: Store results in Table Storage
+    # -------------------------
     record = yield context.call_activity("store_results", report)
+    logging.info(f"Results stored with ID: {record.get('id')}")
 
     return record
 
@@ -127,18 +132,20 @@ def pdf_analyzer_orchestrator(context):
 # 3. ACTIVITY: extract text
 # =============================================================================
 @myApp.activity_trigger(input_name="inputData")
-def extract_text(inputData: dict) -> Dict[str, List[Dict[str, str]]]: # [proposed by AI]
+def extract_text(inputData: dict) -> dict:
     logging.info(f"Starting PDF text extraction for {inputData.get('blob_name')}")
+    pages_text = []
+
     try:
         pdf_bytes = bytes(inputData["blob_bytes"])
         pdf_stream = io.BytesIO(pdf_bytes)
-        reader = PyPDF2.PdfReader(pdf_stream)
-        pages_text = []
+        doc = fitz.open(stream=pdf_stream, filetype="pdf")
 
-        for page_number, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
+        for page_number in range(len(doc)):
+            page = doc[page_number]
+            text = page.get_text("text")  # Extract plain text
             pages_text.append({
-                "page_number": page_number,
+                "page_number": page_number + 1,
                 "text": text
             })
 
@@ -148,7 +155,7 @@ def extract_text(inputData: dict) -> Dict[str, List[Dict[str, str]]]: # [propose
     except Exception as e:
         logging.error(f"PDF text extraction failed: {str(e)}")
         return {"pages": [], "error": str(e)}
-
+    
 # =============================================================================
 # 4. ACTIVITY: Extract Metadata
 # =============================================================================
@@ -240,17 +247,29 @@ def generate_report(reportData: dict):
         "blobPath": blob_name,
         "analyzedAt": datetime.utcnow().isoformat(),
         "analyses": {
-            "text": reportData.get("text", {}), ## updated field name
-            "metadata": reportData.get("metadata", {}), ## updated field name
-            "statistics": reportData.get("stats", {}), ## updated field name
-            "sensitive_data": reportData.get("sensitive_data", {}), ## updated field name
+            "text": reportData.get("text", {}),
+            "metadata": reportData.get("metadata", {}),
+            "statistics": reportData.get("stats", {}),
+            "sensitive_data": reportData.get("sensitive_data", {}),
         },
-        "summary": { ## updated with values from statistics (generated using AI)
+        "summary": {
             "pageCount": reportData.get("stats", {}).get("page_count", 0),
             "wordCount": reportData.get("stats", {}).get("word_count", 0),
             "avgWordsPerPage": reportData.get("stats", {}).get("avg_words_per_page", 0),
             "estimatedReadingTimeMin": reportData.get("stats", {}).get("estimated_reading_time_min", 0),
             "hasText": any(page.get("text") for page in reportData.get("text", {}).get("pages", [])),
+            "emailsDetected": len(reportData.get("sensitive_data", {}).get("emails", [])),
+            "phoneNumbersDetected": len(reportData.get("sensitive_data", {}).get("phone_numbers", [])),
+            "urlsDetected": len(reportData.get("sensitive_data", {}).get("urls", [])),
+            "datesDetected": len(reportData.get("sensitive_data", {}).get("dates", [])),
+            "author": reportData.get("metadata", {}).get("author", "None"),
+            "title": reportData.get("metadata", {}).get("title", "None"),
+            "subject": reportData.get("metadata", {}).get("subject", "None"),
+            "keywords": reportData.get("metadata", {}).get("keywords", "None"),
+            "creator": reportData.get("metadata", {}).get("creator", "None"),
+            "producer": reportData.get("metadata", {}).get("producer", "None"),
+            "creation_date": reportData.get("metadata", {}).get("creation_date", "None"),
+            "modification_date": reportData.get("metadata", {}).get("mod_date", "None")
         }
     }
 

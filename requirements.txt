@@ -7,3 +7,6 @@ azure-functions-durable
 azure-data-tables
 Pillow
 PyPDF2>=3.0.0 # added to handle PDF processing
+pytesseract # added for OCR fallback
+pdf2image # added to convert PDF pages to images for OCR fallback
+PyMuPDF
