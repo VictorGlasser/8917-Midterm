@@ -84,31 +84,23 @@ async def blob_trigger(myblob: func.InputStream, client):
 #   - Chaining: Then generate report -> store results (sequential)
 @myApp.orchestration_trigger(context_name="context")
 def pdf_analyzer_orchestrator(context):
-    # Get input from the blob trigger
     input_data = context.get_input()
     logging.info(f"Orchestrator started for: {input_data['blob_name']}")
 
-    # -------------------------
-    # STEP 1: Extract text first
-    # -------------------------
+    # STEP 1: Extract text
     text_result = yield context.call_activity("extract_text", input_data)
     logging.info(f"Text extraction completed: {len(text_result.get('pages', []))} pages found")
 
-    # -------------------------
-    # STEP 2: Run other analyses in parallel
-    # -------------------------
+    # STEP 2: Run metadata, statistics, sensitive data in parallel
     analysis_tasks = [
-        context.call_activity("extract_metadata", input_data),         # metadata can use original blob
-        context.call_activity("analyze_statistics", text_result),      # statistics need extracted text
-        context.call_activity("detect_sensitive_data", text_result),   # sensitive data detection needs text
+        context.call_activity("extract_metadata", input_data),        # uses blob bytes
+        context.call_activity("analyze_statistics", text_result),     # uses extracted text
+        context.call_activity("detect_sensitive_data", text_result),  # uses extracted text
     ]
-
     metadata_result, stats_result, sensitive_result = yield context.task_all(analysis_tasks)
     logging.info("Parallel analyses completed")
 
-    # -------------------------
     # STEP 3: Generate combined report
-    # -------------------------
     report_input = {
         "blob_name": input_data["blob_name"],
         "text": text_result,
@@ -116,13 +108,10 @@ def pdf_analyzer_orchestrator(context):
         "stats": stats_result,
         "sensitive_data": sensitive_result,
     }
-
     report = yield context.call_activity("generate_report", report_input)
     logging.info(f"Report generated for: {input_data['blob_name']}")
 
-    # -------------------------
-    # STEP 4: Store results in Table Storage
-    # -------------------------
+    # STEP 4: Store results
     record = yield context.call_activity("store_results", report)
     logging.info(f"Results stored with ID: {record.get('id')}")
 
@@ -213,10 +202,12 @@ DATE_REGEX = r"\b(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2})\b"
 @myApp.activity_trigger(input_name="textData")
 def detect_sensitive_data(textData: dict) -> Dict[str, List[str]]:
     pages = textData.get("pages", [])
+    logging.info(f"Scanning {len(pages)} pages for sensitive data")
     emails, phones, urls, dates = [], [], [], []
 
     for page in pages:
         text = page.get("text", "")
+        logging.info(f"Page text preview: {text[:50]}...")  # first 50 chars
         emails.extend(re.findall(EMAIL_REGEX, text))
         phones.extend(re.findall(PHONE_REGEX, text))
         urls.extend(re.findall(URL_REGEX, text))
@@ -235,12 +226,15 @@ def detect_sensitive_data(textData: dict) -> Dict[str, List[str]]:
 # This activity takes the results from all 4 analyses and combines them
 @myApp.activity_trigger(input_name="reportData")
 def generate_report(reportData: dict):
-    logging.info("Generating combined report...")
-
+    logging.info(f"Generating report for {reportData['blob_name']}")
     blob_name = reportData["blob_name"]
-    # Extract just the filename from the full path (e.g., "pdf/class1.jpg" -> "class1.jpg")
     filename = blob_name.split("/")[-1] if "/" in blob_name else blob_name
 
+    # Handle metadata defaults cleanly
+    metadata_fields = ["author","title","subject","keywords","creator","producer","creation_date","mod_date"]
+    summary_metadata = {field: reportData.get("metadata", {}).get(field) or "" for field in metadata_fields}
+
+    # Build report
     report = {
         "id": str(uuid.uuid4()),
         "fileName": filename,
@@ -262,14 +256,7 @@ def generate_report(reportData: dict):
             "phoneNumbersDetected": len(reportData.get("sensitive_data", {}).get("phone_numbers", [])),
             "urlsDetected": len(reportData.get("sensitive_data", {}).get("urls", [])),
             "datesDetected": len(reportData.get("sensitive_data", {}).get("dates", [])),
-            "author": reportData.get("metadata", {}).get("author", "None"),
-            "title": reportData.get("metadata", {}).get("title", "None"),
-            "subject": reportData.get("metadata", {}).get("subject", "None"),
-            "keywords": reportData.get("metadata", {}).get("keywords", "None"),
-            "creator": reportData.get("metadata", {}).get("creator", "None"),
-            "producer": reportData.get("metadata", {}).get("producer", "None"),
-            "creation_date": reportData.get("metadata", {}).get("creation_date", "None"),
-            "modification_date": reportData.get("metadata", {}).get("mod_date", "None")
+            **summary_metadata
         }
     }
 
